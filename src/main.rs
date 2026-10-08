@@ -173,6 +173,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let max_db_bytes = megabytes(&["TOOLSITE_MAX_DB_MB"], toolsite::config::DEFAULT_MAX_DB_BYTES);
     let max_blob_bytes = megabytes(&["TOOLSITE_MAX_BLOB_MB"], toolsite::config::DEFAULT_MAX_BLOB_BYTES);
+    // Rows one query hands back before it says it was truncated. There is
+    // no "no limit": a result is held in memory whole on its way out.
+    let max_rows = match read(&["TOOLSITE_MAX_ROWS"]) {
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|rows| *rows > 0)
+            .unwrap_or_else(|| panic!("TOOLSITE_MAX_ROWS must be a whole number of rows, at least 1, not {value:?}")),
+        None => toolsite::config::DEFAULT_MAX_ROWS,
+    };
 
     // Files go to a bucket when one is configured, else beside the app on
     // disk. The unprefixed names are what a Railway bucket injects by
@@ -308,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
         blobs = blobs.describe(),
         max_db_mb = max_db_bytes / 1024 / 1024,
         max_blob_mb = max_blob_bytes / 1024 / 1024,
+        max_rows,
         "storage configuration (0 MB means no ceiling)"
     );
 
@@ -407,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
         uploads: Mutex::new(HashMap::new()),
         inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes,
+        max_rows,
         blobs,
         blob_uploads: Mutex::new(HashMap::new()),
         providers,
@@ -495,6 +508,7 @@ fn run_user_command(
         uploads: Mutex::new(HashMap::new()),
         inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
+        max_rows: toolsite::config::DEFAULT_MAX_ROWS,
         blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
         blob_uploads: Mutex::new(HashMap::new()),
         providers: Vec::new(),

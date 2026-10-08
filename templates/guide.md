@@ -148,7 +148,9 @@ Start from `<server>/scaffold/<app>`, which is a crate that builds unmodified.
 It gets five capabilities and nothing else:
 
 - `db.query`: this app's own SQLite. Parameters are bound; there is no
-  string-building entry point.
+  string-building entry point. A result stops at the site's row cap (1,000
+  unless the owner set `TOOLSITE_MAX_ROWS`) and says `truncated`, so page
+  with `limit` and `offset` rather than trusting one `select *`.
 - `blobs`: this app's own files. See Files, below.
 - `identity.current-user` / `current-role`: established by the host from a
   verified session. A guest cannot forge either.

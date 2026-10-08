@@ -9,6 +9,9 @@ use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 /// fill the volume by accident. Zero, from the environment, means no ceiling.
 pub const DEFAULT_MAX_DB_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_BLOB_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Rows one query hands back before it stops and says it was truncated, so
+/// a `select *` cannot blow up the caller.
+pub const DEFAULT_MAX_ROWS: usize = 1_000;
 
 pub struct Config {
     pub data_dir: PathBuf,
@@ -25,6 +28,9 @@ pub struct Config {
     pub inline_uploads: Mutex<HashMap<String, InlineUpload>>,
     /// Ceiling on any one SQLite file. Zero means none.
     pub max_db_bytes: u64,
+    /// Rows one query returns, from `TOOLSITE_MAX_ROWS`. Past it the result
+    /// is cut short and marked truncated.
+    pub max_rows: usize,
     /// Where apps' files go, and how big one may be.
     pub blobs: Blobs,
     /// Browser uploads a handler has minted and nobody has spent yet.
@@ -91,6 +97,7 @@ impl Config {
             uploads: Mutex::new(HashMap::new()),
             inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: self.max_db_bytes,
+            max_rows: self.max_rows,
             // A task that needs the bucket gets a config that knows it; the
             // scheduler runs handlers, which may well store files.
             blobs: self.blobs.clone_settings(),
@@ -123,6 +130,7 @@ impl Config {
             uploads: Mutex::new(HashMap::new()),
             inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
+            max_rows: DEFAULT_MAX_ROWS,
             blobs: Blobs::local(DEFAULT_MAX_BLOB_BYTES),
             blob_uploads: Mutex::new(HashMap::new()),
             providers: Vec::new(),

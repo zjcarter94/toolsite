@@ -1686,6 +1686,7 @@ is required to serve HTTP.
 | `TOOLSITE_DEFAULT_ACCESS` | no (default `public`) | The gate an app has until it sets its own: `public`, `authenticated` or `restricted` (`granted`, the old name, still works). Set `restricted` for an internal site. |
 | `TOOLSITE_MAX_DB_MB` | no (default `4096`) | Ceiling on any one SQLite file, in MB. `0` means none. SQLite enforces it, so a runaway insert fails its own statement instead of filling the volume. |
 | `TOOLSITE_MAX_BLOB_MB` | no (default `4096`) | Ceiling on any one stored file, in MB. `0` means none. |
+| `TOOLSITE_MAX_ROWS` | no (default `1000`) | Rows one query returns: a handler's `db.query`, `run_sql`, `toolsite sql`. Past it the result is cut short and says `truncated`. At least `1`. |
 | `TOOLSITE_GITHUB_APP_ID` / `TOOLSITE_GITHUB_APP_PRIVATE_KEY` | no | A GitHub App, so an app's source can live in a repository. The key is the PEM, raw or base64. Both or neither. See GitHub. |
 | `TOOLSITE_GITHUB_APP_SLUG` | no | The App's URL name, for the install link on `/admin/github`. |
 | `TOOLSITE_GITHUB_WEBHOOK_SECRET` | no | Signs the pushes GitHub sends to `/github/webhook`. Without it the webhook is closed. |

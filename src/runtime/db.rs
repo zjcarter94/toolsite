@@ -42,8 +42,6 @@ pub fn bind_identity(conn: &Connection, identity: Option<&Identity>) -> Result<(
 
 /// SQLite's own page size; the ceiling is expressed to it in pages.
 const PAGE_SIZE: u64 = 4096;
-/// Cap on rows returned in one call, so a `select *` can't blow up the caller.
-pub(crate) const MAX_ROWS: usize = 1_000;
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// Every app gets its own file. The path comes from an already-validated slug
@@ -196,7 +194,7 @@ pub fn run_until(
     if let Some(deadline) = deadline {
         interrupt_at(&conn, deadline)?;
     }
-    execute(&conn, sql, params, true)
+    execute(&conn, sql, params, true, config.max_rows)
 }
 
 /// Makes SQLite stop the running statement once `deadline` passes.
@@ -392,7 +390,7 @@ pub fn run_scoped_until(
     };
     conn.authorizer(Some(move |context: AuthContext<'_>| names.authorize(context)))
         .map_err(|e| e.to_string())?;
-    execute(&conn, sql, params, false)
+    execute(&conn, sql, params, false, config.max_rows)
 }
 
 /// The columns of each named view that exists, for a caller deciding what to
@@ -444,7 +442,7 @@ fn describe(error: rusqlite::Error) -> String {
     }
 }
 
-fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Result<SqlOutcome, String> {
+fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool, max_rows: usize) -> Result<SqlOutcome, String> {
     let mut statement = match conn.prepare(sql) {
         Ok(statement) => statement,
         Err(rusqlite::Error::MultipleStatement) if !params.is_empty() || !scripts => {
@@ -497,7 +495,7 @@ fn execute(conn: &Connection, sql: &str, params: &[Value], scripts: bool) -> Res
     let mut rows = Vec::new();
     let mut truncated = false;
     while let Some(row) = cursor.next().map_err(describe)? {
-        if rows.len() >= MAX_ROWS {
+        if rows.len() >= max_rows {
             truncated = true;
             break;
         }
@@ -618,7 +616,33 @@ mod tests {
         .unwrap();
 
         let out = run(&config, "app", "select i from n", &[]).unwrap();
-        assert_eq!(out.rows.len(), MAX_ROWS);
+        assert_eq!(out.rows.len(), crate::config::DEFAULT_MAX_ROWS);
+        assert!(out.truncated);
+    }
+
+    #[test]
+    fn the_row_cap_is_the_sites_to_set() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table n (i integer)", &[]).unwrap();
+        run(
+            &config,
+            "app",
+            "insert into n with recursive c(i) as (select 1 union all select i+1 from c where i<1500) select i from c",
+            &[],
+        )
+        .unwrap();
+
+        // Raised: the whole table fits, and nothing claims otherwise.
+        let roomy = Config { max_rows: 2_000, ..config };
+        let out = run(&roomy, "app", "select i from n", &[]).unwrap();
+        assert_eq!(out.rows.len(), 1_500);
+        assert!(!out.truncated);
+
+        // Lowered: the cap is where the site put it, and says so.
+        let tight = Config { max_rows: 10, ..roomy };
+        let out = run(&tight, "app", "select i from n order by i", &[]).unwrap();
+        assert_eq!(out.rows.len(), 10);
+        assert_eq!(out.rows[9], vec![json!(10)]);
         assert!(out.truncated);
     }
 
@@ -848,6 +872,16 @@ mod tests {
         assert_eq!(update.rows_affected, 1);
         let delete = scoped(&config, &alice(), &scope, "delete from my_orders where total = 11").unwrap();
         assert_eq!(delete.rows_affected, 1);
+    }
+
+    #[test]
+    fn a_scoped_read_is_held_to_the_sites_row_cap_too() {
+        let (_dir, config) = config();
+        let scope = shop(&config, false);
+        let tight = Config { max_rows: 1, ..config };
+        let out = scoped(&tight, &alice(), &scope, "select total from my_orders order by total").unwrap();
+        assert_eq!(out.rows, vec![vec![json!(10.0)]]);
+        assert!(out.truncated);
     }
 
     #[test]
