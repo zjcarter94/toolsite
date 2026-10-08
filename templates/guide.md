@@ -168,6 +168,11 @@ The host sets `x-toolsite-scheduled` on a job run and `x-toolsite-tool` on an
 app tool call. Client copies of any `x-toolsite-*` header are stripped, so
 each means what it says.
 
+A job run that answers 2xx with `x-toolsite-again: 1` runs again at once
+instead of at its next scheduled time, at most 60 times a minute, never two
+at a time. That is how work longer than one run's limits gets done: a step
+per run, its place kept in the database, until a run answers without it.
+
 ## Files
 
 Uploads, images, exports, datasets: anything too large or too opaque for a

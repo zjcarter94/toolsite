@@ -217,6 +217,28 @@ impl Guest for Handler {
                 }
             }
 
+            // A job in steps: each run records one under its route and
+            // answers with x-toolsite-again while there is more to do.
+            // `/again` is done after five, `/again-always` never is, and
+            // `/again-failing` asks while answering 500.
+            "/again" | "/again-always" | "/again-failing" => {
+                if let Err(e) = db::query("create table if not exists steps (route text)", &[]) {
+                    return respond(500, format!("{e:?}"));
+                }
+                let taken = db::query("insert into steps values (?)", &[db::Value::Text(route.clone())])
+                    .and_then(|_| db::query("select count(*) from steps where route = ?", &[db::Value::Text(route.clone())]));
+                let steps = match taken.map(|rows| rows.values.first().and_then(|r| r.first()).cloned()) {
+                    Ok(Some(db::Value::Integer(n))) => n,
+                    other => return respond(500, format!("unexpected {other:?}")),
+                };
+                let more = route != "/again" || steps < 5;
+                Response {
+                    status: if route == "/again-failing" { 500 } else { 200 },
+                    headers: if more { vec![("x-toolsite-again".to_string(), "1".to_string())] } else { Vec::new() },
+                    body: format!("step {steps}").into_bytes(),
+                }
+            }
+
             // Proves parameters are bound rather than interpolated.
             "/echo-param" => {
                 let body = String::from_utf8_lossy(&req.body).to_string();

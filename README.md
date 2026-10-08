@@ -580,6 +580,24 @@ missed its turn while the server was down fires once when it comes back, not
 once per missed interval, and a job still running when its next turn arrives
 is skipped rather than stacked.
 
+**Work in steps.** One run gets a job's limits, a minute at most. Work that
+takes longer does a step per run and keeps its place in the database; to
+take the next step without waiting for the schedule, the handler answers the
+step with `x-toolsite-again: 1`, and the job runs again at once. It is still
+one job: no tick starts a second copy while the steps go on. Only a success
+(2xx) from a run the scheduler started is heard, not a Run now or a visitor's
+request, and a job runs again at most 60 times a minute; past that it waits
+for its next scheduled time.
+
+```rust
+let more = step(&db)?;   // one bounded piece of the work
+Response {
+    status: 200,
+    headers: if more { vec![("x-toolsite-again".into(), "1".into())] } else { vec![] },
+    body: vec![],
+}
+```
+
 ## Settings
 
 An app's handler can read values its bundle must not contain: API keys,

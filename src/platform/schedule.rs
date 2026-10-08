@@ -10,11 +10,11 @@ use crate::{config::Config, content::slug::valid_slug, AppState};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How often the scheduler looks for work. Jobs fire at most once per tick,
@@ -28,6 +28,16 @@ const JOB_GUARDS: crate::runtime::wasm::Guards = crate::runtime::wasm::Guards {
     memory_bytes: 128 * 1024 * 1024,
     wall_clock: Duration::from_secs(60),
 };
+
+/// The response header a scheduled run answers with to be run again at
+/// once rather than at its next scheduled time: one step of a long piece of
+/// work done, more to come. Heard only from a run the scheduler started.
+pub const AGAIN_HEADER: &str = "x-toolsite-again";
+
+/// How many times in a minute one job may run again on its own say-so.
+/// Past that it waits for its schedule, so a handler that always asks
+/// cannot keep a worker busy for good.
+pub const AGAIN_PER_MINUTE: usize = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -146,6 +156,18 @@ fn is_due(job: &Job, at: u64) -> bool {
 /// This is also what an on-demand run uses, so the two cannot behave
 /// differently.
 pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<String, String> {
+    run_once(state, app, name).await.map(|ran| ran.status)
+}
+
+/// What one run came to.
+struct Ran {
+    status: String,
+    /// The handler answered with success and `AGAIN_HEADER`.
+    again: bool,
+}
+
+/// `run_job`, also saying whether the handler asked to run again.
+async fn run_once(state: &AppState, app: &str, name: &str) -> Result<Ran, String> {
     let jobs = read_jobs(&state.config, app);
     let job = jobs.get(name).cloned().ok_or_else(|| format!("{app} has no job called {name}"))?;
 
@@ -172,14 +194,23 @@ pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<String, 
     })
     .await;
 
-    let status = match outcome {
-        Ok(Ok(response)) => format!("{}", response.status),
-        Ok(Err(error)) => format!("failed: {error}"),
-        Err(error) => format!("failed: {error}"),
+    let (status, again) = match outcome {
+        // Only a step that worked may ask for the next one: a failing one
+        // waits for its schedule rather than failing again at once.
+        Ok(Ok(response)) => (
+            format!("{}", response.status),
+            (200..300).contains(&response.status)
+                && response
+                    .headers
+                    .iter()
+                    .any(|(header, value)| header.eq_ignore_ascii_case(AGAIN_HEADER) && !matches!(value.trim(), "" | "0")),
+        ),
+        Ok(Err(error)) => (format!("failed: {error}"), false),
+        Err(error) => (format!("failed: {error}"), false),
     };
 
     record_run(&state.config, app, name, &status);
-    Ok(status)
+    Ok(Ran { status, again })
 }
 
 /// Records an outcome against a job. Used by the scheduler, and by tests
@@ -216,6 +247,9 @@ pub struct Scheduler {
     /// `app:job` for each job in progress, so a slow one is skipped rather
     /// than stacked.
     running: Arc<Mutex<HashSet<String>>>,
+    /// `app:job` to when it last ran again on its own say-so, within the
+    /// past minute, for `AGAIN_PER_MINUTE`.
+    again: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
 }
 
 impl Scheduler {
@@ -223,7 +257,23 @@ impl Scheduler {
         Self {
             state,
             running: Arc::default(),
+            again: Arc::default(),
         }
+    }
+
+    /// Whether the job under `key` may run again now, counting it if so.
+    fn may_run_again(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut again = self.again.lock().unwrap();
+        let recent = again.entry(key.to_string()).or_default();
+        while recent.front().is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60)) {
+            recent.pop_front();
+        }
+        if recent.len() >= AGAIN_PER_MINUTE {
+            return false;
+        }
+        recent.push_back(now);
+        true
     }
 
     /// Wakes every tick and starts whatever is due.
@@ -251,13 +301,34 @@ impl Scheduler {
                     tracing::warn!(app, job = name, "still running; skipping this turn");
                     continue;
                 }
-                let (state, running, app) = (self.state.clone(), self.running.clone(), app.clone());
+                let (scheduler, app) = (self.clone(), app.clone());
                 started.push(tokio::spawn(async move {
-                    match run_job(&state, &app, &name).await {
-                        Ok(status) => tracing::info!(app, job = name, status, "job ran"),
-                        Err(error) => tracing::warn!(app, job = name, error, "job failed"),
+                    // A run that asks to go again does, at once, and is
+                    // still the one run as far as any tick can tell: the
+                    // job is skipped until the last of them ends.
+                    loop {
+                        match run_once(&scheduler.state, &app, &name).await {
+                            Ok(ran) => {
+                                tracing::info!(app, job = name, status = ran.status, again = ran.again, "job ran");
+                                if !ran.again {
+                                    break;
+                                }
+                                if !scheduler.may_run_again(&key) {
+                                    tracing::warn!(
+                                        app,
+                                        job = name,
+                                        "asked to run again more than {AGAIN_PER_MINUTE} times in a minute; it waits for its schedule"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(app, job = name, error, "job failed");
+                                break;
+                            }
+                        }
                     }
-                    running.lock().unwrap().remove(&key);
+                    scheduler.running.lock().unwrap().remove(&key);
                 }));
             }
         }

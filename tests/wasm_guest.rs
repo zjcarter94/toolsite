@@ -285,6 +285,102 @@ async fn a_scheduled_job_runs_the_apps_handler_and_records_what_happened() {
     assert_eq!(counted.rows[0][0], serde_json::json!(2));
 }
 
+/// A site with the fixture published as `app`, jobs for each step route,
+/// and a scheduler, for the tests of `x-toolsite-again`.
+fn stepping_site() -> (TempDir, Arc<Config>, toolsite::AppState, toolsite::platform::schedule::Scheduler) {
+    let (dir, config) = site();
+    let state = toolsite::AppState {
+        config: config.clone(),
+        runtime: Runtime::new().unwrap(),
+    };
+    std::fs::create_dir_all(config.data_dir.join("app")).unwrap();
+    std::fs::write(config.data_dir.join("app/handler.wasm"), HANDLER).unwrap();
+    for route in ["again", "again-always", "again-failing"] {
+        toolsite::platform::schedule::set_job(&config, "app", route, "* * * * * *", &format!("/api/{route}")).unwrap();
+    }
+    let scheduler = toolsite::platform::schedule::Scheduler::new(state.clone());
+    (dir, config, state, scheduler)
+}
+
+fn steps(config: &Config, route: &str) -> i64 {
+    toolsite::runtime::db::run(config, "app", "select count(*) from steps where route = ?", &[serde_json::json!(route)])
+        .map(|out| out.rows[0][0].as_i64().unwrap())
+        .unwrap_or(0)
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Work in steps no longer waits a tick between them: one tick, and the job
+/// runs until it stops asking.
+#[tokio::test]
+async fn a_scheduled_job_that_asks_to_run_again_runs_again_at_once_until_it_is_done() {
+    let (_dir, config, _state, scheduler) = stepping_site();
+    toolsite::platform::schedule::remove_job(&config, "app", "again-always").unwrap();
+    toolsite::platform::schedule::remove_job(&config, "app", "again-failing").unwrap();
+
+    for run in scheduler.tick(now()).await {
+        run.await.unwrap();
+    }
+    assert_eq!(steps(&config, "/again"), 5);
+    let jobs = toolsite::platform::schedule::read_jobs(&config, "app");
+    assert_eq!(jobs["again"].last_status.as_deref(), Some("200"));
+}
+
+/// The header means something only to the scheduler: a run by hand is one
+/// run, whatever the handler answers.
+#[tokio::test]
+async fn asking_to_run_again_is_heard_only_from_a_scheduled_run() {
+    let (_dir, config, state, _scheduler) = stepping_site();
+    let status = toolsite::platform::schedule::run_job(&state, "app", "again").await.unwrap();
+    assert_eq!(status, "200");
+    assert_eq!(steps(&config, "/again"), 1);
+}
+
+/// A step that fails waits for its schedule rather than failing again
+/// straight away.
+#[tokio::test]
+async fn a_failing_run_is_not_run_again_however_it_asks() {
+    let (_dir, config, _state, scheduler) = stepping_site();
+    toolsite::platform::schedule::remove_job(&config, "app", "again").unwrap();
+    toolsite::platform::schedule::remove_job(&config, "app", "again-always").unwrap();
+
+    for run in scheduler.tick(now()).await {
+        run.await.unwrap();
+    }
+    assert_eq!(steps(&config, "/again-failing"), 1);
+    let jobs = toolsite::platform::schedule::read_jobs(&config, "app");
+    assert_eq!(jobs["again-failing"].last_status.as_deref(), Some("500"));
+}
+
+/// A handler that always asks is held to the cap, and while it runs no tick
+/// starts a second copy of it.
+#[tokio::test]
+async fn a_job_that_always_asks_again_is_held_to_the_cap_and_never_doubled() {
+    let (_dir, config, _state, scheduler) = stepping_site();
+    toolsite::platform::schedule::remove_job(&config, "app", "again").unwrap();
+    toolsite::platform::schedule::remove_job(&config, "app", "again-failing").unwrap();
+    let cap = toolsite::platform::schedule::AGAIN_PER_MINUTE as i64;
+
+    let at = now();
+    let first = scheduler.tick(at).await;
+    assert_eq!(first.len(), 1);
+    // Still running its steps: the job is due, but this tick leaves it be.
+    assert!(scheduler.tick(at + 1).await.is_empty(), "a second copy started while the first ran");
+    for run in first {
+        run.await.unwrap();
+    }
+    assert_eq!(steps(&config, "/again-always"), 1 + cap);
+
+    // Its next scheduled run still happens, but the minute's allowance is
+    // spent, so it is one run and no more.
+    for run in scheduler.tick(now() + 2).await {
+        run.await.unwrap();
+    }
+    assert_eq!(steps(&config, "/again-always"), 2 + cap);
+}
+
 #[tokio::test]
 async fn a_job_for_an_app_with_no_handler_says_so_rather_than_failing_silently() {
     let dir = tempfile::tempdir().unwrap();
