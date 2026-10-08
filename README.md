@@ -439,7 +439,8 @@ The guest sees the path relative to its app (`/api/echo`, not
 
 **What a handler can and cannot do.** It gets five imports and nothing else:
 `db.query`, bound to its own app's database with parameters bound rather than
-interpolated; `blobs`, its own files; `identity.current-user` and
+interpolated, and `db.batch`, a list of such statements in one transaction
+that takes effect whole or not at all; `blobs`, its own files; `identity.current-user` and
 `current-role`, which it cannot forge; `secrets.get`, settings the owner
 entered; and `fetch.send`, only to hosts the app declared. It gets no
 filesystem, no environment, no sockets, and no clock beyond what the world

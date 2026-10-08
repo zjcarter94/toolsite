@@ -53,7 +53,7 @@ use self::toolsite::app::blobs::{
 };
 use self::toolsite::app::connections::Message as WitMessage;
 pub use self::toolsite::app::connections::{ConnectInfo, Event as ConnectionEvent, Message as ConnectionMessage};
-use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Value as WitValue};
+use self::toolsite::app::db::{Error as WitDbError, Rows as WitRows, Statement as WitStatement, Value as WitValue};
 // Request and Response already land at module scope from bindgen; User sits
 // under its interface, so re-export it rather than making callers spell out
 // the generated path.
@@ -251,21 +251,29 @@ impl StoreState {
 }
 
 fn wit_rows(outcome: Result<db::SqlOutcome, String>) -> Result<WitRows, WitDbError> {
-    match outcome {
-        Ok(outcome) => Ok(WitRows {
-            columns: outcome.columns,
-            values: outcome
-                .rows
-                .into_iter()
-                .map(|row| row.into_iter().map(wit_of).collect())
-                .collect(),
-            truncated: outcome.truncated,
-            rows_affected: outcome.rows_affected as u64,
-        }),
-        // The authorizer's refusals are reported as their own case so a
-        // guest can tell "you may not" from "that query was wrong".
-        Err(message) if message.contains("not authorized") => Err(WitDbError::Denied(message)),
-        Err(message) => Err(WitDbError::Failed(message)),
+    outcome.map(wit_rows_of).map_err(wit_db_error)
+}
+
+fn wit_rows_of(outcome: db::SqlOutcome) -> WitRows {
+    WitRows {
+        columns: outcome.columns,
+        values: outcome
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().map(wit_of).collect())
+            .collect(),
+        truncated: outcome.truncated,
+        rows_affected: outcome.rows_affected as u64,
+    }
+}
+
+/// The authorizer's refusals are reported as their own case so a guest can
+/// tell "you may not" from "that query was wrong".
+fn wit_db_error(message: String) -> WitDbError {
+    if message.contains("not authorized") {
+        WitDbError::Denied(message)
+    } else {
+        WitDbError::Failed(message)
     }
 }
 
@@ -292,6 +300,17 @@ impl self::toolsite::app::db::Host for StoreState {
         let meta = crate::content::store::read_meta_blocking(&self.site, &self.app);
         let scope = db::Scope::of(&meta);
         wit_rows(db::run_scoped_until(&self.site, &self.app, identity.as_ref(), &scope, &sql, &params, Some(self.deadline)))
+    }
+
+    fn batch(&mut self, statements: Vec<WitStatement>) -> Result<Vec<WitRows>, WitDbError> {
+        let statements: Vec<(String, Vec<serde_json::Value>)> = statements
+            .into_iter()
+            .map(|statement| (statement.sql, statement.params.into_iter().map(json_of).collect()))
+            .collect();
+        let identity = self.identity();
+        db::batch_until(&self.site, &self.app, identity.as_ref(), &statements, Some(self.deadline))
+            .map(|outcomes| outcomes.into_iter().map(wit_rows_of).collect())
+            .map_err(wit_db_error)
     }
 }
 

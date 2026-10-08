@@ -41,6 +41,24 @@ interface db {
     /// policy says `write = true`. Nothing else in the database is reachable,
     /// whatever the SQL says. For an app that lets its own users type SQL.
     query-scoped: func(sql: string, params: list<value>) -> result<rows, error>;
+
+    /// One statement of a batch, with its parameters.
+    record statement {
+        sql: string,
+        params: list<value>,
+    }
+
+    /// Runs `statements` in order, in one transaction: all of them take
+    /// effect, or, if one fails, is refused or runs past the call's time,
+    /// none do. Each is one statement, bound and answered as `query` would,
+    /// with its own rows. A statement may not begin, commit or roll back a
+    /// transaction of its own. The error names the failing statement,
+    /// counting from zero.
+    ///
+    /// Added beside `query` rather than changing it, so a handler built
+    /// before it links unchanged. There is no scoped batch: a person's SQL
+    /// never holds a transaction open.
+    batch: func(statements: list<statement>) -> result<list<rows>, error>;
 }
 
 /// Values the site's owner set for this app: API keys, endpoints, anything

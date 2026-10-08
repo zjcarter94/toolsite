@@ -99,6 +99,78 @@ fn a_guest_cannot_attach_a_sibling_apps_database() {
     assert!(body.contains("not authorized"), "{body}");
 }
 
+fn batch(lines: &[&str]) -> toolsite::runtime::wasm::Request {
+    let mut req = request("/batch");
+    req.method = "POST".to_string();
+    req.body = lines.join("\n").into_bytes();
+    req
+}
+
+#[test]
+fn a_guest_batch_is_one_transaction_with_its_parameters_bound() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+    toolsite::runtime::db::run(&site, "app", "create table notes (body text unique)", &[]).unwrap();
+    let count = || toolsite::runtime::db::run(&site, "app", "select count(*) from notes", &[]).unwrap().rows[0][0].clone();
+
+    let payload = "'); drop table notes; --";
+    let (status, body) = call(&runtime, &site, "app", batch(&[
+        &format!("insert into notes values (?)\t{payload}"),
+        "insert into notes values ('two')",
+        "select body from notes order by rowid",
+    ]));
+    assert_eq!((status, body.as_str()), (200, format!("3:{payload};two").as_str()));
+
+    // A failure late in the list leaves nothing from earlier in it.
+    let (status, body) = call(&runtime, &site, "app", batch(&[
+        "insert into notes values ('three')",
+        "insert into notes values ('two')",
+    ]));
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains("statement 1") && body.contains("UNIQUE"), "{body}");
+    assert_eq!(count(), serde_json::json!(2));
+}
+
+#[test]
+fn a_guest_batch_is_held_to_the_same_refusals_as_a_query() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+    call(&runtime, &site, "victim", request("/count"));
+    toolsite::runtime::db::run(&site, "attacker", "create table notes (body text)", &[]).unwrap();
+
+    for refused in ["attach database '../victim/data.db' as v", "pragma journal_mode=delete", "commit"] {
+        let (status, body) = call(&runtime, &site, "attacker", batch(&["insert into notes values ('x')", refused]));
+        assert_eq!(status, 403, "{refused}: {body}");
+        assert!(body.contains("not authorized"), "{refused}: {body}");
+    }
+    let left = toolsite::runtime::db::run(&site, "attacker", "select count(*) from notes", &[]).unwrap();
+    assert_eq!(left.rows[0][0], serde_json::json!(0));
+}
+
+#[test]
+fn a_guest_batch_that_runs_out_of_time_writes_nothing() {
+    let runtime = Runtime::new().unwrap();
+    let (_dir, site) = site();
+    toolsite::runtime::db::run(&site, "app", "create table notes (body text)", &[]).unwrap();
+    let guards = Guards {
+        wall_clock: Duration::from_millis(300),
+        ..Guards::default()
+    };
+    let response = runtime.handle(site.clone(), "app", HANDLER, None, batch(&[
+        "insert into notes values ('x')",
+        "with recursive c(i) as (select 1 union all select i+1 from c) select count(*) from c",
+    ]), guards);
+    // Either the statement is interrupted and reported, or the guest is
+    // stopped at its deadline; nothing is written either way.
+    if let Ok(response) = response {
+        let body = String::from_utf8_lossy(&response.body).to_string();
+        assert_eq!(response.status, 500, "{body}");
+        assert!(body.contains("interrupt"), "{body}");
+    }
+    let left = toolsite::runtime::db::run(&site, "app", "select count(*) from notes", &[]).unwrap();
+    assert_eq!(left.rows[0][0], serde_json::json!(0));
+}
+
 #[test]
 fn parameters_from_a_guest_are_bound_not_interpolated() {
     let runtime = Runtime::new().unwrap();

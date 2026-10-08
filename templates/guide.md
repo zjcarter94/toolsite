@@ -148,7 +148,10 @@ Start from `<server>/scaffold/<app>`, which is a crate that builds unmodified.
 It gets five capabilities and nothing else:
 
 - `db.query`: this app's own SQLite. Parameters are bound; there is no
-  string-building entry point.
+  string-building entry point. `db.batch` runs a list of statements in one
+  transaction: all of them take effect or, if one fails or the call runs
+  out of time, none do. Use it for anything that must not half happen, and
+  for many writes at once, which it makes one commit instead of one each.
 - `blobs`: this app's own files. See Files, below.
 - `identity.current-user` / `current-role`: established by the host from a
   verified session. A guest cannot forge either.

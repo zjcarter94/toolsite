@@ -217,6 +217,31 @@ impl Guest for Handler {
                 }
             }
 
+            // A batch from the body: a statement per line, with any text
+            // parameters after it, tab separated. Answers with how many
+            // statements answered and the last one's rows.
+            "/batch" => {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                let statements: Vec<db::Statement> = body
+                    .lines()
+                    .map(|line| {
+                        let mut fields = line.split('\t');
+                        db::Statement {
+                            sql: fields.next().unwrap_or_default().to_string(),
+                            params: fields.map(|p| db::Value::Text(p.to_string())).collect(),
+                        }
+                    })
+                    .collect();
+                match db::batch(&statements) {
+                    Ok(answers) => respond(
+                        200,
+                        format!("{}:{}", answers.len(), answers.last().map(rows_text).unwrap_or_default()),
+                    ),
+                    Err(db::Error::Denied(m)) => respond(403, format!("denied: {m}")),
+                    Err(db::Error::Failed(m)) => respond(500, format!("failed: {m}")),
+                }
+            }
+
             // Proves parameters are bound rather than interpolated.
             "/echo-param" => {
                 let body = String::from_utf8_lossy(&req.body).to_string();

@@ -199,6 +199,68 @@ pub fn run_until(
     execute(&conn, sql, params, true)
 }
 
+/// `run_until` for several statements at once: in order, on one
+/// connection, in one transaction, so either every one takes effect or,
+/// when one fails, is refused or is interrupted at `deadline`, none does.
+///
+/// Each is one statement with its parameters, never a script, under the
+/// same authorizer and row cap as `run_until`, and none may begin, commit,
+/// roll back or savepoint: that would end the transaction early and leave
+/// the statements before it written. An error names the statement it came
+/// from, counting from zero.
+pub fn batch_until(
+    config: &Config,
+    app: &str,
+    identity: Option<&Identity>,
+    statements: &[(String, Vec<Value>)],
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<SqlOutcome>, String> {
+    let mut conn = open_as(config, app, identity)?;
+    if let Some(deadline) = deadline {
+        interrupt_at(&conn, deadline)?;
+    }
+    // Immediate, so the write lock is taken, or waited for, before anything
+    // runs, rather than found taken halfway through.
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(describe)?;
+    transaction
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => Authorization::Deny,
+            _ => deny_escapes(context),
+        }))
+        .map_err(|e| e.to_string())?;
+    let mut outcomes = Vec::with_capacity(statements.len());
+    for (n, (sql, params)) in statements.iter().enumerate() {
+        match execute(&transaction, sql, params, false) {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) => {
+                undo(transaction);
+                return Err(format!("statement {n}: {error}"));
+            }
+        }
+    }
+    transaction.authorizer(Some(deny_escapes)).map_err(|e| e.to_string())?;
+    // A commit the deadline interrupts fails like any statement, and the
+    // transaction is rolled back.
+    if let Err(error) = transaction.execute_batch("commit") {
+        undo(transaction);
+        return Err(describe(error));
+    }
+    Ok(outcomes)
+}
+
+/// Rolls a batch back. The deadline that may have stopped it would stop the
+/// rollback too, so it is lifted first; and should the rollback fail all
+/// the same, the connection closing with the transaction open undoes it.
+fn undo(transaction: rusqlite::Transaction<'_>) {
+    transaction.progress_handler(0, None::<fn() -> bool>).ok();
+    transaction.authorizer(Some(deny_escapes)).ok();
+    if let Err(error) = transaction.rollback() {
+        tracing::warn!(%error, "a batch could not be rolled back; closing its connection undoes it");
+    }
+}
+
 /// Makes SQLite stop the running statement once `deadline` passes.
 fn interrupt_at(conn: &Connection, deadline: std::time::Instant) -> Result<(), String> {
     conn.progress_handler(1_000, Some(move || std::time::Instant::now() >= deadline))
@@ -685,6 +747,151 @@ mod tests {
         run(&config, "app", "create table t (a)", &[]).unwrap();
         let out = run(&config, "app", "insert into t values (1)", &[]).unwrap();
         assert_eq!(out.rows_affected, 1);
+    }
+
+    // --- batches -----------------------------------------------------------
+
+    fn statements(list: &[(&str, Vec<Value>)]) -> Vec<(String, Vec<Value>)> {
+        list.iter().map(|(sql, params)| (sql.to_string(), params.clone())).collect()
+    }
+
+    fn count(config: &Config) -> Value {
+        run(config, "app", "select count(*) from t", &[]).unwrap().rows[0][0].clone()
+    }
+
+    #[test]
+    fn a_batch_takes_effect_whole_and_answers_each_statement() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (a integer unique, b text)", &[]).unwrap();
+        let outcomes = batch_until(
+            &config,
+            "app",
+            None,
+            &statements(&[
+                ("insert into t values (?, ?)", vec![json!(1), json!("one")]),
+                ("insert into t values (?, ?)", vec![json!(2), json!("two")]),
+                ("select b from t order by a", vec![]),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[0].rows_affected, 1);
+        assert_eq!(outcomes[2].rows, vec![vec![json!("one")], vec![json!("two")]]);
+        assert_eq!(count(&config), json!(2));
+    }
+
+    #[test]
+    fn a_batch_with_a_failing_statement_writes_nothing() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (a integer unique)", &[]).unwrap();
+        let error = batch_until(
+            &config,
+            "app",
+            None,
+            &statements(&[
+                ("insert into t values (1)", vec![]),
+                ("insert into t values (2)", vec![]),
+                ("insert into t values (1)", vec![]),
+                ("insert into t values (3)", vec![]),
+            ]),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("statement 2:") && error.contains("UNIQUE"), "{error}");
+        assert_eq!(count(&config), json!(0));
+    }
+
+    #[test]
+    fn a_batch_interrupted_at_its_deadline_writes_nothing() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (a integer)", &[]).unwrap();
+        let started = std::time::Instant::now();
+        let error = batch_until(
+            &config,
+            "app",
+            None,
+            &statements(&[
+                ("insert into t values (1)", vec![]),
+                // Never ends on its own.
+                ("with recursive c(i) as (select 1 union all select i+1 from c) select count(*) from c", vec![]),
+            ]),
+            Some(started + std::time::Duration::from_millis(200)),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("statement 1:") && error.contains("interrupt"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "the deadline did not stop it");
+        assert_eq!(count(&config), json!(0));
+    }
+
+    #[test]
+    fn a_batch_cannot_reach_another_file_or_end_its_own_transaction() {
+        let (_dir, config) = config();
+        run(&config, "victim", "create table secrets (a)", &[]).unwrap();
+        run(&config, "app", "create table t (a integer)", &[]).unwrap();
+        for refused in [
+            "attach database '../victim/data.db' as v",
+            "pragma journal_mode=delete",
+            "commit",
+            "end",
+            "rollback",
+            "begin",
+            "savepoint s",
+            "release s",
+        ] {
+            let error = batch_until(
+                &config,
+                "app",
+                None,
+                &statements(&[("insert into t values (1)", vec![]), (refused, vec![]), ("insert into t values (2)", vec![])]),
+                None,
+            )
+            .unwrap_err();
+            assert!(error.starts_with("statement 1:") && error.contains("not authorized"), "{refused}: {error}");
+            assert_eq!(count(&config), json!(0), "{refused} let the first insert through");
+        }
+        // A script would be a way to smuggle any of those past one check.
+        let error = batch_until(&config, "app", None, &statements(&[("insert into t values (1); commit", vec![])]), None)
+            .unwrap_err();
+        assert!(error.contains("one statement"), "{error}");
+        assert_eq!(count(&config), json!(0));
+        // And the connection is the app's own afterwards, as it was before.
+        let error = run(&config, "app", "attach database '../victim/data.db' as v", &[]).unwrap_err();
+        assert!(error.contains("not authorized"), "{error}");
+    }
+
+    #[test]
+    fn a_batch_binds_parameters_and_answers_as_the_caller() {
+        let (_dir, config) = config();
+        run(&config, "app", "create table t (body text, owner text)", &[]).unwrap();
+        let payload = "'); drop table t; --";
+        let outcomes = batch_until(
+            &config,
+            "app",
+            Some(&alice()),
+            &statements(&[
+                ("insert into t values (?, current_user())", vec![json!(payload)]),
+                ("select body, owner from t", vec![]),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcomes[1].rows, vec![vec![json!(payload), json!("u-alice")]]);
+    }
+
+    #[test]
+    fn a_batch_reads_are_capped_like_any_other() {
+        let (_dir, config) = config();
+        let outcomes = batch_until(
+            &config,
+            "app",
+            None,
+            &statements(&[("with recursive c(i) as (select 1 union all select i+1 from c where i<1500) select i from c", vec![])]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcomes[0].rows.len(), MAX_ROWS);
+        assert!(outcomes[0].truncated);
     }
 
     // --- identity and scope -------------------------------------------------
