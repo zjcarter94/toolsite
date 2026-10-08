@@ -115,6 +115,10 @@ pub struct PageMeta {
     /// events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident: Option<ResidentMeta>,
+    /// What the app's `[limits]` asked for its requests and jobs. Absent
+    /// values take the site's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<LimitsMeta>,
     /// The DNS label of the app's host in subdomain mode, assigned once by
     /// `origins::label_for` so the host never changes under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +133,24 @@ pub struct ResidentMeta {
     pub memory_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tick_ms: Option<u64>,
+}
+
+/// Guards an app asked for in place of the site's defaults, each checked
+/// against the site's ceiling at deploy and held to it again at run time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct LimitsMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_fuel: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_memory_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_fuel: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_memory_mb: Option<u64>,
 }
 
 /// How a port carries bytes.
@@ -260,6 +282,7 @@ impl Default for PageMeta {
             socket_protocols: Default::default(),
             ports: Vec::new(),
             resident: None,
+            limits: None,
             label: None,
         }
     }

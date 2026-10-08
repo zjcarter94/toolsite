@@ -452,6 +452,28 @@ wall-clock deadline. A handler that loops forever is killed and returns 500;
 the server keeps serving. Because instances are never reused, state must live
 in the database.
 
+A request gets 200 million instructions of fuel, 64 MB and 5 seconds; a
+scheduled job gets 2 billion, 128 MB and 60 seconds. An app that needs more
+asks in `toolsite.toml`, and gets it only as far as the site's owner allows:
+
+```toml
+[limits]
+page_fuel = 1000000000   # each optional; absent keeps the default
+page_seconds = 15
+page_memory_mb = 128
+job_fuel = 20000000000
+job_seconds = 300
+job_memory_mb = 512
+```
+
+Every ceiling (`TOOLSITE_PAGE_MAX_FUEL`, `TOOLSITE_PAGE_MAX_SECONDS`,
+`TOOLSITE_PAGE_MAX_MB`, and the same three for `JOB`) starts at the default,
+so a value above it is refused at deploy, naming the setting to raise, until
+the owner raises it. Asking for less is always allowed. The block is declared
+wholesale: without it, the defaults. `page_*` covers every request to the
+app's handler, app tool calls included; connection events keep the
+defaults.
+
 ## An app's schema
 
 Put numbered `.sql` files in `migrations/` beside the source. `toolsite
@@ -1706,6 +1728,12 @@ is required to serve HTTP.
 | `TOOLSITE_UDP_PER_SECOND` | no (default `100`) | Datagrams one IP address may send to a port each second. The rest are dropped. |
 | `TOOLSITE_UDP_QUEUED_BYTES` | no (default `8388608`) | Bytes of datagrams waiting for the handler on one UDP port, across its remotes. The rest are dropped. |
 | `TOOLSITE_TCP_SEND_SECONDS` | no (default `10`) | A TCP peer that takes none of a reply for this long is closed. |
+| `TOOLSITE_PAGE_MAX_FUEL` | no (default `200000000`) | The most fuel an app's `[limits]` may give one request. The default is also what a request gets when the app does not ask; this may not be lower. See Server-side code. |
+| `TOOLSITE_PAGE_MAX_SECONDS` | no (default `5`) | The most wall-clock seconds an app's `[limits]` may give one request. |
+| `TOOLSITE_PAGE_MAX_MB` | no (default `64`) | The most memory an app's `[limits]` may give one request, in MB. |
+| `TOOLSITE_JOB_MAX_FUEL` | no (default `2000000000`) | The most fuel an app's `[limits]` may give one run of a scheduled job. |
+| `TOOLSITE_JOB_MAX_SECONDS` | no (default `60`) | The most wall-clock seconds an app's `[limits]` may give one run of a job. |
+| `TOOLSITE_JOB_MAX_MB` | no (default `128`) | The most memory an app's `[limits]` may give one run of a job, in MB. |
 | `TOOLSITE_RESIDENT_MEMORY_MB` | no (default `128`) | Memory cap of a resident app's instance when its `[resident]` block does not set `memory_mb`. See Resident mode. |
 | `TOOLSITE_RESIDENT_MAX_MB` | no (default `512`) | The most memory a resident app may ask for. A larger `memory_mb` is refused at deploy. |
 | `TOOLSITE_RESIDENT_MAX` | no (default `20`) | The most resident instances that run at once. Each is a thread. |

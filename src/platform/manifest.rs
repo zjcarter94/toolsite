@@ -12,7 +12,7 @@
 
 use crate::{
     config::Config,
-    content::store::{read_meta, write_meta, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
+    content::store::{read_meta, write_meta, LimitsMeta, PageMeta, PathRule, Policy, PortProtocol, PortSocket, ResidentMeta},
     platform::schedule,
     runtime::{resident, wasm::Runtime},
 };
@@ -69,6 +69,32 @@ pub struct Manifest {
     /// Declared wholesale: without the block, the app runs fresh per event.
     #[serde(default)]
     pub resident: Option<ResidentDecl>,
+    /// More fuel, time or memory for the app's requests and jobs than the
+    /// site gives by default, up to its ceilings. Declared wholesale:
+    /// without the block, the defaults.
+    #[serde(default)]
+    pub limits: Option<LimitsDecl>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsDecl {
+    /// Instructions one request may execute.
+    #[serde(default)]
+    pub page_fuel: Option<u64>,
+    /// Wall-clock seconds one request may take.
+    #[serde(default)]
+    pub page_seconds: Option<u64>,
+    /// Memory one request's instance may grow to, in MB.
+    #[serde(default)]
+    pub page_memory_mb: Option<u64>,
+    /// The same three for one run of a scheduled job.
+    #[serde(default)]
+    pub job_fuel: Option<u64>,
+    #[serde(default)]
+    pub job_seconds: Option<u64>,
+    #[serde(default)]
+    pub job_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,7 +233,8 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
              [access] views, [[access.table]] (table, view, where, owner, write), \
              [[tool]] (name, title, description, path, read_only, destructive, idempotent, \
              open_world, input, output), [[socket]] (path, or protocol = \"tcp\" | \"udp\" and port), \
-             [resident] (enabled, memory_mb, tick_ms)."
+             [resident] (enabled, memory_mb, tick_ms), [limits] (page_fuel, page_seconds, \
+             page_memory_mb, job_fuel, job_seconds, job_memory_mb)."
         )
     })?;
 
@@ -300,6 +327,10 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
     let resident = match &manifest.resident {
         Some(declared) if declared.enabled => Some(check_resident(config, runtime, app, declared).await?),
         _ => None,
+    };
+    let limits = match &manifest.limits {
+        Some(declared) => check_limits(config, declared)?,
+        None => None,
     };
 
     let mut changed = Vec::new();
@@ -399,6 +430,14 @@ async fn apply_inner(config: &Config, runtime: Option<&Runtime>, app: &str, toml
             }
         });
         meta.resident = resident;
+    }
+
+    if meta.limits != limits {
+        changed.push(match &limits {
+            None => "limits withdrawn".to_string(),
+            Some(limits) => format!("limits: {}", describe_limits(limits)),
+        });
+        meta.limits = limits;
     }
 
     // Declared wholesale: a route removed from the file is removed here.
@@ -580,6 +619,53 @@ async fn check_resident(
         memory_mb: declared.memory_mb,
         tick_ms: declared.tick_ms,
     })
+}
+
+/// Checks a `[limits]` block against the site's ceilings. An empty block is
+/// no limits at all, the same as none.
+fn check_limits(config: &Config, declared: &LimitsDecl) -> Result<Option<LimitsMeta>, String> {
+    const MIB: u64 = 1024 * 1024;
+    let site = &config.guards;
+    let ceilings = [
+        ("page_fuel", declared.page_fuel, site.page_max.fuel, "TOOLSITE_PAGE_MAX_FUEL"),
+        ("page_seconds", declared.page_seconds, site.page_max.wall_clock.as_secs(), "TOOLSITE_PAGE_MAX_SECONDS"),
+        ("page_memory_mb", declared.page_memory_mb, site.page_max.memory_bytes as u64 / MIB, "TOOLSITE_PAGE_MAX_MB"),
+        ("job_fuel", declared.job_fuel, site.job_max.fuel, "TOOLSITE_JOB_MAX_FUEL"),
+        ("job_seconds", declared.job_seconds, site.job_max.wall_clock.as_secs(), "TOOLSITE_JOB_MAX_SECONDS"),
+        ("job_memory_mb", declared.job_memory_mb, site.job_max.memory_bytes as u64 / MIB, "TOOLSITE_JOB_MAX_MB"),
+    ];
+    for (key, asked, max, variable) in ceilings {
+        if let Some(asked) = asked
+            && !(1..=max).contains(&asked)
+        {
+            return Err(format!("[limits] {key} must be 1 to {max} on this site ({variable}), got {asked}"));
+        }
+    }
+    let limits = LimitsMeta {
+        page_fuel: declared.page_fuel,
+        page_seconds: declared.page_seconds,
+        page_memory_mb: declared.page_memory_mb,
+        job_fuel: declared.job_fuel,
+        job_seconds: declared.job_seconds,
+        job_memory_mb: declared.job_memory_mb,
+    };
+    Ok((limits != LimitsMeta::default()).then_some(limits))
+}
+
+/// `page_fuel = 400000000, job_seconds = 300`, for what a deploy reports.
+fn describe_limits(limits: &LimitsMeta) -> String {
+    [
+        ("page_fuel", limits.page_fuel),
+        ("page_seconds", limits.page_seconds),
+        ("page_memory_mb", limits.page_memory_mb),
+        ("job_fuel", limits.job_fuel),
+        ("job_seconds", limits.job_seconds),
+        ("job_memory_mb", limits.job_memory_mb),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| format!("{key} = {value}")))
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// Turns declared tools into stored ones, checking everything first: a
@@ -862,6 +948,47 @@ mod tests {
         }
         // A handler not uploaded yet is checked when it arrives.
         apply(&config, "app", "[resident]\nenabled = true\nmemory_mb = 512\n").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn limits_past_the_sites_ceiling_are_refused_naming_the_setting() {
+        let (_t, config) = config();
+        for (manifest, says) in [
+            ("[limits]\npage_fuel = 200000001\n", "page_fuel must be 1 to 200000000 on this site (TOOLSITE_PAGE_MAX_FUEL)"),
+            ("[limits]\npage_seconds = 6\n", "page_seconds must be 1 to 5 on this site (TOOLSITE_PAGE_MAX_SECONDS)"),
+            ("[limits]\npage_memory_mb = 65\n", "page_memory_mb must be 1 to 64 on this site (TOOLSITE_PAGE_MAX_MB)"),
+            ("[limits]\njob_fuel = 2000000001\n", "(TOOLSITE_JOB_MAX_FUEL)"),
+            ("[limits]\njob_seconds = 61\n", "job_seconds must be 1 to 60 on this site (TOOLSITE_JOB_MAX_SECONDS)"),
+            ("[limits]\njob_memory_mb = 0\n", "job_memory_mb must be 1 to 128 on this site (TOOLSITE_JOB_MAX_MB)"),
+            ("[limits]\nfuel = 5\n", "fuel"),
+        ] {
+            let error = apply(&config, "app", manifest).await.unwrap_err();
+            assert!(error.contains(says), "{manifest:?}: {error}");
+        }
+        assert!(read_meta(&config, "app").await.limits.is_none(), "a refused block was written");
+        // Less than the default is always allowed: an app may hold itself in.
+        apply(&config, "app", "[limits]\npage_seconds = 2\n").await.unwrap();
+        assert_eq!(read_meta(&config, "app").await.limits, Some(LimitsMeta { page_seconds: Some(2), ..Default::default() }));
+    }
+
+    #[tokio::test]
+    async fn limits_up_to_a_raised_ceiling_are_kept_and_withdrawn_with_the_block() {
+        let (_t, mut config) = config();
+        config.guards.page_max.wall_clock = std::time::Duration::from_secs(30);
+        config.guards.job_max.fuel = 20_000_000_000;
+        let changed = apply(&config, "app", "[limits]\npage_seconds = 30\njob_fuel = 20000000000\n").await.unwrap();
+        assert!(changed.iter().any(|c| c == "limits: page_seconds = 30, job_fuel = 20000000000"), "{changed:?}");
+        let limits = read_meta(&config, "app").await.limits.unwrap();
+        assert_eq!(config.guards.page(Some(&limits)).wall_clock, std::time::Duration::from_secs(30));
+        assert_eq!(config.guards.job(Some(&limits)).fuel, 20_000_000_000);
+
+        // An empty block asks for nothing, and so does no block.
+        apply(&config, "app", "[limits]\n").await.unwrap();
+        assert!(read_meta(&config, "app").await.limits.is_none());
+        apply(&config, "app", "[limits]\njob_seconds = 30\n").await.unwrap();
+        let changed = apply(&config, "app", "gate = \"public\"\n").await.unwrap();
+        assert!(changed.contains(&"limits withdrawn".to_string()), "{changed:?}");
+        assert!(read_meta(&config, "app").await.limits.is_none());
     }
 
     #[tokio::test]

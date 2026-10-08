@@ -21,14 +21,6 @@ use std::{
 /// so this is also the coarsest resolution a schedule really has.
 const TICK: Duration = Duration::from_secs(30);
 
-/// A job that runs long enough to be stuck is not retried on the next tick;
-/// it is left alone and reported.
-const JOB_GUARDS: crate::runtime::wasm::Guards = crate::runtime::wasm::Guards {
-    fuel: 2_000_000_000,
-    memory_bytes: 128 * 1024 * 1024,
-    wall_clock: Duration::from_secs(60),
-};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     /// Standard cron with seconds leading, as the `cron` crate reads it.
@@ -163,12 +155,19 @@ pub async fn run_job(state: &AppState, app: &str, name: &str) -> Result<String, 
         body: Vec::new(),
     };
 
+    // A job's guards, as the app's `[limits]` set them within the site's
+    // ceilings. A job that runs long enough to be stuck is not retried on
+    // the next tick; it is left alone and reported.
+    let guards = state
+        .config
+        .guards
+        .job(crate::content::store::read_meta(&state.config, app).await.limits.as_ref());
     let runtime = state.runtime.clone();
     let config = state.config.clone();
     let owned_app = app.to_string();
     let outcome = tokio::task::spawn_blocking(move || {
         // No identity: a scheduled run is the app acting on its own behalf.
-        runtime.handle(config, &owned_app, &wasm, None, request, JOB_GUARDS)
+        runtime.handle(config, &owned_app, &wasm, None, request, guards)
     })
     .await;
 

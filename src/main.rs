@@ -383,6 +383,47 @@ async fn main() -> anyhow::Result<()> {
         "resident apps configuration"
     );
 
+    // The most an app's [limits] may give its requests and jobs. Each
+    // ceiling starts at the default, so nothing changes until it is raised,
+    // and none may sit below the default it bounds.
+    let guard_defaults = toolsite::runtime::wasm::GuardLimits::default();
+    const MIB: u64 = 1024 * 1024;
+    let ceiling = |name: &str, default: u64| -> u64 {
+        let max = count(name, default);
+        if max < default {
+            panic!("{name} is {max}, below the default of {default} it bounds");
+        }
+        max
+    };
+    let guard_limits = toolsite::runtime::wasm::GuardLimits {
+        page_max: toolsite::runtime::wasm::Guards {
+            fuel: ceiling("TOOLSITE_PAGE_MAX_FUEL", guard_defaults.page.fuel),
+            wall_clock: std::time::Duration::from_secs(ceiling(
+                "TOOLSITE_PAGE_MAX_SECONDS",
+                guard_defaults.page.wall_clock.as_secs(),
+            )),
+            memory_bytes: (ceiling("TOOLSITE_PAGE_MAX_MB", guard_defaults.page.memory_bytes as u64 / MIB) * MIB) as usize,
+        },
+        job_max: toolsite::runtime::wasm::Guards {
+            fuel: ceiling("TOOLSITE_JOB_MAX_FUEL", guard_defaults.job.fuel),
+            wall_clock: std::time::Duration::from_secs(ceiling(
+                "TOOLSITE_JOB_MAX_SECONDS",
+                guard_defaults.job.wall_clock.as_secs(),
+            )),
+            memory_bytes: (ceiling("TOOLSITE_JOB_MAX_MB", guard_defaults.job.memory_bytes as u64 / MIB) * MIB) as usize,
+        },
+        ..guard_defaults
+    };
+    tracing::info!(
+        page_max_fuel = guard_limits.page_max.fuel,
+        page_max_seconds = guard_limits.page_max.wall_clock.as_secs(),
+        page_max_mb = guard_limits.page_max.memory_bytes as u64 / MIB,
+        job_max_fuel = guard_limits.job_max.fuel,
+        job_max_seconds = guard_limits.job_max.wall_clock.as_secs(),
+        job_max_mb = guard_limits.job_max.memory_bytes as u64 / MIB,
+        "what an app's [limits] may ask for"
+    );
+
     // TCP and UDP ports beyond HTTP, each given to one app by the site's
     // owner: `1883=mqtt-broker,5514/udp=syslog`. A bad map is a startup
     // error, not a device that cannot connect.
@@ -407,6 +448,7 @@ async fn main() -> anyhow::Result<()> {
         uploads: Mutex::new(HashMap::new()),
         inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes,
+        guards: guard_limits,
         blobs,
         blob_uploads: Mutex::new(HashMap::new()),
         providers,
@@ -495,6 +537,7 @@ fn run_user_command(
         uploads: Mutex::new(HashMap::new()),
         inline_uploads: Mutex::new(HashMap::new()),
         max_db_bytes: toolsite::config::DEFAULT_MAX_DB_BYTES,
+        guards: Default::default(),
         blobs: toolsite::runtime::blobs::Blobs::local(toolsite::config::DEFAULT_MAX_BLOB_BYTES),
         blob_uploads: Mutex::new(HashMap::new()),
         providers: Vec::new(),

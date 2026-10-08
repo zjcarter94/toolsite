@@ -1878,6 +1878,33 @@ async fn an_unknown_upload_flag_is_refused_not_published() {
     assert!(page.contains("the app"), "a probe replaced the page: {page}");
 }
 
+/// `[limits]` reaches the guest: shown by an app holding itself to so
+/// little fuel that what worked a moment ago runs out, for a request and for
+/// a job alike.
+#[tokio::test]
+async fn an_apps_limits_are_the_ones_its_requests_and_jobs_run_under() {
+    let (_dir, config) = server();
+    publish_handler(&config, "lean");
+    let (status, ..) = send(&config, get("/p/lean/api/count")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    toolsite::platform::manifest::apply(&config, "lean", "[limits]\npage_fuel = 1000\njob_fuel = 1000\n")
+        .await
+        .unwrap();
+    let (status, ..) = send(&config, get("/p/lean/api/count")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "the request ran past the app's own fuel");
+
+    let state = toolsite::AppState { config: config.clone(), runtime: Runtime::new().unwrap() };
+    toolsite::platform::schedule::set_job(&config, "lean", "count", "0 * * * * *", "/api/count").unwrap();
+    let status = toolsite::platform::schedule::run_job(&state, "lean", "count").await.unwrap();
+    assert!(status.starts_with("failed"), "the job ran past the app's own fuel: {status}");
+
+    // Withdrawn, the defaults are back.
+    toolsite::platform::manifest::apply(&config, "lean", "").await.unwrap();
+    let (status, ..) = send(&config, get("/p/lean/api/count")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn a_client_cannot_claim_a_request_came_from_the_scheduler() {
     let (_dir, config) = server();

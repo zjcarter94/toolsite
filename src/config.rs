@@ -25,6 +25,10 @@ pub struct Config {
     pub inline_uploads: Mutex<HashMap<String, InlineUpload>>,
     /// Ceiling on any one SQLite file. Zero means none.
     pub max_db_bytes: u64,
+    /// The fuel, time and memory an app's requests and jobs get, and the
+    /// most its `[limits]` may raise them to, from `TOOLSITE_PAGE_MAX_*` and
+    /// `TOOLSITE_JOB_MAX_*`.
+    pub guards: crate::runtime::wasm::GuardLimits,
     /// Where apps' files go, and how big one may be.
     pub blobs: Blobs,
     /// Browser uploads a handler has minted and nobody has spent yet.
@@ -91,6 +95,7 @@ impl Config {
             uploads: Mutex::new(HashMap::new()),
             inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: self.max_db_bytes,
+            guards: self.guards,
             // A task that needs the bucket gets a config that knows it; the
             // scheduler runs handlers, which may well store files.
             blobs: self.blobs.clone_settings(),
@@ -123,6 +128,7 @@ impl Config {
             uploads: Mutex::new(HashMap::new()),
             inline_uploads: Mutex::new(HashMap::new()),
             max_db_bytes: DEFAULT_MAX_DB_BYTES,
+            guards: Default::default(),
             blobs: Blobs::local(DEFAULT_MAX_BLOB_BYTES),
             blob_uploads: Mutex::new(HashMap::new()),
             providers: Vec::new(),

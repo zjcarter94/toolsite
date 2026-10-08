@@ -6,7 +6,7 @@ use crate::{
             icon_path, is_hidden, read_meta, Icon,
         },
     },
-    runtime::wasm::{Guards, Request as WasmRequest},
+    runtime::wasm::Request as WasmRequest,
     AppState,
 };
 use maud::{html, Markup};
@@ -507,6 +507,8 @@ async fn run_handler(
         id: user.id,
         email: user.email,
     });
+    // What the app's `[limits]` asked for, within the site's ceilings.
+    let guards = config.guards.page(read_meta(&config, app).await.limits.as_ref());
     // Guest execution is blocking and CPU-bound, and the database import
     // blocks too, so it must not run on an async worker.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -516,7 +518,7 @@ async fn run_handler(
             &wasm,
             user,
             guest_request,
-            Guards::default(),
+            guards,
         )
     })
     .await;

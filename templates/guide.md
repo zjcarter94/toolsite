@@ -164,6 +164,11 @@ Every request runs in a fresh instance with a fuel ceiling, a memory cap and a
 wall-clock deadline. State must live in the database. A global does not
 survive the request that set it.
 
+A request gets 200 million instructions, 64 MB and 5 seconds; a job run 2
+billion, 128 MB and 60 seconds. `[limits]` in toolsite.toml asks for more,
+and the deploy refuses anything past the site's ceilings, naming the
+setting the owner would raise. Ceilings start at the defaults.
+
 The host sets `x-toolsite-scheduled` on a job run and `x-toolsite-tool` on an
 app tool call. Client copies of any `x-toolsite-*` header are stripped, so
 each means what it says.
@@ -229,6 +234,10 @@ gate = "restricted"
 name = "refresh"
 schedule = "0 */5 * * * *"
 path = "/api/refresh"
+
+[limits]                   # optional, each key too; up to the site's ceilings
+page_seconds = 15          # also page_fuel, page_memory_mb
+job_seconds = 300          # also job_fuel, job_memory_mb
 ```
 
 Routes, jobs and tools are replaced wholesale, so deleting a line removes the

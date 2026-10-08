@@ -92,6 +92,71 @@ impl Default for Guards {
     }
 }
 
+impl Guards {
+    /// What a scheduled job gets: ten times a request's fuel, twice its
+    /// memory and a minute, since nobody is waiting on the other end.
+    pub const JOB: Guards = Guards {
+        fuel: 2_000_000_000,
+        memory_bytes: 128 * 1024 * 1024,
+        wall_clock: Duration::from_secs(60),
+    };
+}
+
+/// The guards an app's requests and jobs get, and the most its `[limits]`
+/// may ask for: the site's ceilings, from `TOOLSITE_PAGE_MAX_*` and
+/// `TOOLSITE_JOB_MAX_*`. Each ceiling starts at its default, so an app gets
+/// more only once the site's owner raises one.
+#[derive(Clone, Copy, Debug)]
+pub struct GuardLimits {
+    /// A request's guards when its app does not say.
+    pub page: Guards,
+    /// The most a request's may be raised to.
+    pub page_max: Guards,
+    /// A job's guards when its app does not say.
+    pub job: Guards,
+    /// The most a job's may be raised to.
+    pub job_max: Guards,
+}
+
+impl Default for GuardLimits {
+    fn default() -> Self {
+        Self {
+            page: Guards::default(),
+            page_max: Guards::default(),
+            job: Guards::JOB,
+            job_max: Guards::JOB,
+        }
+    }
+}
+
+impl GuardLimits {
+    /// The guards for one of the app's requests: the defaults, with what
+    /// its `[limits]` asked for in their place, never past the ceilings.
+    pub fn page(&self, asked: Option<&crate::content::store::LimitsMeta>) -> Guards {
+        let asked = asked.copied().unwrap_or_default();
+        within(self.page, self.page_max, asked.page_fuel, asked.page_seconds, asked.page_memory_mb)
+    }
+
+    /// `page`, for one of the app's scheduled jobs.
+    pub fn job(&self, asked: Option<&crate::content::store::LimitsMeta>) -> Guards {
+        let asked = asked.copied().unwrap_or_default();
+        within(self.job, self.job_max, asked.job_fuel, asked.job_seconds, asked.job_memory_mb)
+    }
+}
+
+/// `default` with each value asked for in its place, held to `max`. The
+/// ceiling is applied here as well as at deploy, since a site's owner may
+/// lower it after an app asked.
+fn within(default: Guards, max: Guards, fuel: Option<u64>, seconds: Option<u64>, memory_mb: Option<u64>) -> Guards {
+    Guards {
+        fuel: fuel.map_or(default.fuel, |fuel| fuel.min(max.fuel)),
+        memory_bytes: memory_mb.map_or(default.memory_bytes, |mb| {
+            usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX).min(max.memory_bytes)
+        }),
+        wall_clock: seconds.map_or(default.wall_clock, |seconds| Duration::from_secs(seconds).min(max.wall_clock)),
+    }
+}
+
 /// What one table element is counted as against the memory cap: a pointer.
 const TABLE_ELEMENT_BYTES: usize = 8;
 
@@ -807,6 +872,41 @@ mod tests {
 
     fn runtime() -> Arc<Runtime> {
         Runtime::new().unwrap()
+    }
+
+    #[test]
+    fn an_app_that_asks_for_nothing_gets_exactly_todays_guards() {
+        let site = GuardLimits::default();
+        for asked in [None, Some(crate::content::store::LimitsMeta::default())] {
+            let page = site.page(asked.as_ref());
+            let job = site.job(asked.as_ref());
+            assert_eq!((page.fuel, page.memory_bytes, page.wall_clock), (200_000_000, 64 << 20, Duration::from_secs(5)));
+            assert_eq!((job.fuel, job.memory_bytes, job.wall_clock), (2_000_000_000, 128 << 20, Duration::from_secs(60)));
+        }
+    }
+
+    #[test]
+    fn what_an_app_asked_for_is_held_to_the_ceiling_the_site_has_now() {
+        let mut site = GuardLimits::default();
+        site.page_max = Guards { fuel: 1_000_000_000, memory_bytes: 256 << 20, wall_clock: Duration::from_secs(30) };
+        let asked = crate::content::store::LimitsMeta {
+            page_fuel: Some(800_000_000),
+            page_seconds: Some(20),
+            page_memory_mb: Some(1),
+            job_seconds: Some(10),
+            ..Default::default()
+        };
+        let page = site.page(Some(&asked));
+        assert_eq!((page.fuel, page.memory_bytes, page.wall_clock), (800_000_000, 1 << 20, Duration::from_secs(20)));
+        // Only what was asked moves: the job keeps its fuel and memory.
+        let job = site.job(Some(&asked));
+        assert_eq!((job.fuel, job.memory_bytes, job.wall_clock), (2_000_000_000, 128 << 20, Duration::from_secs(10)));
+
+        // The owner lowers the ceiling after the deploy: the app gets the
+        // new ceiling, not what it was once allowed.
+        site.page_max = Guards::default();
+        let page = site.page(Some(&asked));
+        assert_eq!((page.fuel, page.wall_clock), (200_000_000, Duration::from_secs(5)));
     }
 
     fn test_site() -> Arc<SiteConfig> {
