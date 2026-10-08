@@ -234,6 +234,10 @@ path = "/api/refresh"
 Routes, jobs and tools are replaced wholesale, so deleting a line removes the
 thing. Anything the file does not mention is left alone. Tools: see App tools.
 
+A job runs at the scheduler's first look after its time, and at most once
+per look. The scheduler looks every 30 seconds unless the site's owner set
+another tick, so a schedule finer than that fires once per look.
+
 ## App tools
 
 An app can offer MCP tools. Each tool is a handler route you already write;

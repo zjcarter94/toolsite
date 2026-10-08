@@ -574,6 +574,11 @@ Six cron fields, seconds first: `0 */5 * * * *` is every five minutes,
 rather than silently never firing. The app's Jobs tab on `/admin` shows the
 same list with the last run and its status, and a Run now button.
 
+The scheduler looks for due jobs every 30 seconds, or as often as
+`TOOLSITE_SCHEDULER_TICK_SECS` says, and a job runs at the first look after
+its time, at most once per look. So the tick is the finest a schedule really
+fires: `*/5 * * * * *` on the default tick runs every thirty seconds.
+
 The handler sees an `x-toolsite-scheduled` header naming the job, so a route
 can behave differently when nobody is waiting on the other end. A job that
 missed its turn while the server was down fires once when it comes back, not
@@ -1706,6 +1711,7 @@ is required to serve HTTP.
 | `TOOLSITE_UDP_PER_SECOND` | no (default `100`) | Datagrams one IP address may send to a port each second. The rest are dropped. |
 | `TOOLSITE_UDP_QUEUED_BYTES` | no (default `8388608`) | Bytes of datagrams waiting for the handler on one UDP port, across its remotes. The rest are dropped. |
 | `TOOLSITE_TCP_SEND_SECONDS` | no (default `10`) | A TCP peer that takes none of a reply for this long is closed. |
+| `TOOLSITE_SCHEDULER_TICK_SECS` | no (default `30`) | How often the scheduler looks for due jobs, in seconds; at least `1`. A job runs at the first look after its time, at most once per look. See Scheduled work. |
 | `TOOLSITE_RESIDENT_MEMORY_MB` | no (default `128`) | Memory cap of a resident app's instance when its `[resident]` block does not set `memory_mb`. See Resident mode. |
 | `TOOLSITE_RESIDENT_MAX_MB` | no (default `512`) | The most memory a resident app may ask for. A larger `memory_mb` is refused at deploy. |
 | `TOOLSITE_RESIDENT_MAX` | no (default `20`) | The most resident instances that run at once. Each is a thread. |

@@ -285,6 +285,41 @@ async fn a_scheduled_job_runs_the_apps_handler_and_records_what_happened() {
     assert_eq!(counted.rows[0][0], serde_json::json!(2));
 }
 
+/// The tick a site sets is the one the running scheduler keeps: with a
+/// second, a job due every second runs again well inside the thirty seconds
+/// the default would make it wait.
+#[tokio::test]
+async fn the_scheduler_looks_as_often_as_the_site_says() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config::local(dir.path().to_path_buf(), "test-token"));
+    let state = toolsite::AppState {
+        config: config.clone(),
+        runtime: Runtime::new().unwrap(),
+    };
+    std::fs::create_dir_all(config.data_dir.join("app")).unwrap();
+    std::fs::write(config.data_dir.join("app/handler.wasm"), HANDLER).unwrap();
+    toolsite::platform::schedule::set_job(&config, "app", "often", "* * * * * *", "/api/count").unwrap();
+
+    // Once by hand first, so compiling the handler is not what is timed.
+    toolsite::platform::schedule::run_job(&state, "app", "often").await.unwrap();
+    let first = toolsite::platform::schedule::read_jobs(&config, "app")["often"].last_run.unwrap();
+
+    toolsite::platform::schedule::Scheduler::new(state)
+        .every(Duration::from_secs(1))
+        .spawn();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let counted = toolsite::runtime::db::run(&config, "app", "select count(*) from hits", &[]).unwrap();
+        if counted.rows[0][0].as_i64().unwrap() >= 3 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the scheduler did not run the job twice in 20 seconds");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let last = toolsite::platform::schedule::read_jobs(&config, "app")["often"].last_run.unwrap();
+    assert!(last > first, "the scheduled runs were not recorded");
+}
+
 #[tokio::test]
 async fn a_job_for_an_app_with_no_handler_says_so_rather_than_failing_silently() {
     let dir = tempfile::tempdir().unwrap();

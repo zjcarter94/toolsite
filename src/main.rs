@@ -383,6 +383,17 @@ async fn main() -> anyhow::Result<()> {
         "resident apps configuration"
     );
 
+    // How often the scheduler looks for due jobs. A job fires at the first
+    // look after its time, so a shorter tick is a shorter wait.
+    let scheduler_tick = count("TOOLSITE_SCHEDULER_TICK_SECS", toolsite::platform::schedule::DEFAULT_TICK.as_secs());
+    if scheduler_tick < toolsite::platform::schedule::MIN_TICK.as_secs() {
+        panic!(
+            "TOOLSITE_SCHEDULER_TICK_SECS must be at least {}, not {scheduler_tick}",
+            toolsite::platform::schedule::MIN_TICK.as_secs()
+        );
+    }
+    tracing::info!(tick_seconds = scheduler_tick, "scheduler configuration");
+
     // TCP and UDP ports beyond HTTP, each given to one app by the site's
     // owner: `1883=mqtt-broker,5514/udp=syslog`. A bad map is a startup
     // error, not a device that cannot connect.
@@ -441,6 +452,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         runtime: runtime.clone(),
     })
+    .every(std::time::Duration::from_secs(scheduler_tick))
     .spawn();
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -17,9 +17,14 @@ use std::{
     time::Duration,
 };
 
-/// How often the scheduler looks for work. Jobs fire at most once per tick,
-/// so this is also the coarsest resolution a schedule really has.
-const TICK: Duration = Duration::from_secs(30);
+/// How often the scheduler looks for work unless the site says otherwise
+/// (`TOOLSITE_SCHEDULER_TICK_SECS`). Jobs fire at most once per tick, so
+/// this is also the coarsest resolution a schedule really has.
+pub const DEFAULT_TICK: Duration = Duration::from_secs(30);
+
+/// The shortest tick a site may ask for. A schedule's resolution is a
+/// second, so anything finer would only wake the process to find nothing.
+pub const MIN_TICK: Duration = Duration::from_secs(1);
 
 /// A job that runs long enough to be stuck is not retried on the next tick;
 /// it is left alone and reported.
@@ -118,21 +123,20 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// Whether a job is due, given when it last ran.
+/// Whether a job is due at `at`, given when it last ran.
 ///
 /// The question asked is "did a scheduled time pass since we last ran", not
 /// "is it that second now" — a tick every thirty seconds would otherwise miss
-/// almost everything.
-fn is_due(job: &Job, at: u64) -> bool {
+/// almost everything. `since_tick` is where the tick's own window opens,
+/// which is what a job that has never run is measured from.
+fn is_due(job: &Job, at: u64, since_tick: u64) -> bool {
     let Ok(schedule) = cron::Schedule::from_str(&job.schedule) else {
         return false;
     };
     // From the last run, so a job that missed its turn while the server was
-    // down still fires once. With no last run the window is a single tick,
-    // so creating a yearly job does not set it off immediately.
-    let since = job
-        .last_run
-        .unwrap_or_else(|| at.saturating_sub(TICK.as_secs()));
+    // down still fires once. With no last run the window is the tick's, so
+    // creating a yearly job does not set it off immediately.
+    let since = job.last_run.unwrap_or(since_tick);
     let Some(after) = chrono::DateTime::from_timestamp(since as i64, 0) else {
         return false;
     };
@@ -208,6 +212,18 @@ async fn apps_with_jobs(config: &Config) -> Vec<String> {
     apps
 }
 
+/// Where a tick at `at` opens its window for jobs that have never run: at
+/// the tick before it, so one tick's window ends where the next begins and
+/// every second is looked at exactly once, however late a tick wakes. The
+/// first tick, or one whose predecessor is somehow later, looks back one
+/// tick.
+fn window_start(previous: Option<u64>, at: u64, tick: Duration) -> u64 {
+    match previous {
+        Some(previous) if previous <= at => previous,
+        _ => at.saturating_sub(tick.as_secs()),
+    }
+}
+
 /// What runs an app's jobs on their schedules. A process starts one, from
 /// `main`, for the data directory it serves: two would each fire every job.
 #[derive(Clone)]
@@ -216,6 +232,10 @@ pub struct Scheduler {
     /// `app:job` for each job in progress, so a slow one is skipped rather
     /// than stacked.
     running: Arc<Mutex<HashSet<String>>>,
+    /// How long it sleeps between looks.
+    period: Duration,
+    /// When the previous tick looked, in Unix seconds.
+    last_tick: Arc<Mutex<Option<u64>>>,
 }
 
 impl Scheduler {
@@ -223,6 +243,17 @@ impl Scheduler {
         Self {
             state,
             running: Arc::default(),
+            period: DEFAULT_TICK,
+            last_tick: Arc::default(),
+        }
+    }
+
+    /// Looks for work every `tick` instead of every `DEFAULT_TICK`, but
+    /// never more often than `MIN_TICK`.
+    pub fn every(self, tick: Duration) -> Self {
+        Self {
+            period: tick.max(MIN_TICK),
+            ..self
         }
     }
 
@@ -230,7 +261,7 @@ impl Scheduler {
     pub fn spawn(self) {
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(TICK).await;
+                tokio::time::sleep(self.period).await;
                 self.tick(now()).await;
             }
         });
@@ -240,10 +271,12 @@ impl Scheduler {
     /// running from an earlier tick. Returns the runs it started, which
     /// finish on their own; awaiting them is for whoever wants to know when.
     pub async fn tick(&self, at: u64) -> Vec<tokio::task::JoinHandle<()>> {
+        let previous = self.last_tick.lock().unwrap().replace(at);
+        let since_tick = window_start(previous, at, self.period);
         let mut started = Vec::new();
         for app in apps_with_jobs(&self.state.config).await {
             for (name, job) in read_jobs(&self.state.config, &app) {
-                if !is_due(&job, at) {
+                if !is_due(&job, at, since_tick) {
                     continue;
                 }
                 let key = format!("{app}:{name}");
@@ -305,21 +338,22 @@ mod tests {
             last_run: Some(BOUNDARY - 20),
             ..every_minute.clone()
         };
-        assert!(is_due(&missed, at));
+        let since_tick = at - DEFAULT_TICK.as_secs();
+        assert!(is_due(&missed, at, since_tick));
 
         // Ran after it, and the next one has not arrived: not due.
         let recent = Job {
             last_run: Some(BOUNDARY + 5),
             ..every_minute.clone()
         };
-        assert!(!is_due(&recent, at));
+        assert!(!is_due(&recent, at, since_tick));
 
         // Down for an hour: it fires once, not once per missed minute.
         let long_gone = Job {
             last_run: Some(BOUNDARY - 3600),
             ..every_minute
         };
-        assert!(is_due(&long_gone, at));
+        assert!(is_due(&long_gone, at, since_tick));
     }
 
     #[test]
@@ -332,7 +366,88 @@ mod tests {
         };
         // Without a last run the window is one tick, not all of history, so a
         // rare job does not fire the moment it is created.
-        assert!(!is_due(&new_year, now()));
+        let at = now();
+        assert!(!is_due(&new_year, at, window_start(None, at, DEFAULT_TICK)));
+    }
+
+    /// Ticks the way the loop does, `period` apart plus however late each
+    /// one wakes, and records a run at the tick that started it. Returns the
+    /// ticks at which the job fired.
+    fn fires(job: &Job, period: Duration, ticks: impl Iterator<Item = u64>) -> Vec<u64> {
+        let mut job = job.clone();
+        let mut previous = None;
+        let mut fired = Vec::new();
+        for at in ticks {
+            let since_tick = window_start(previous, at, period);
+            previous = Some(at);
+            if is_due(&job, at, since_tick) {
+                fired.push(at);
+                job.last_run = Some(at);
+            }
+        }
+        fired
+    }
+
+    #[test]
+    fn a_job_that_never_ran_fires_exactly_once_for_its_moment_at_any_tick() {
+        // A yearly job, created a few ticks before its moment: whatever the
+        // tick, it fires once, at the first tick at or after that moment.
+        const MOMENT: u64 = 1_000_000_020; // 2001-09-09 01:47:00 UTC
+        let once = Job {
+            schedule: "0 47 1 9 9 *".to_string(),
+            path: "/api/x".to_string(),
+            last_run: None,
+            last_status: None,
+        };
+        // Each tick wakes up to two seconds late, which is what a loaded
+        // machine does to `sleep(tick)` followed by the work of a tick, and
+        // the ticks start at every offset, so the moment lands everywhere
+        // between two of them. Measured back one tick from each, some of
+        // these moments fell between the windows and never fired.
+        for period in [1, 2, 5, 7, 30, 45] {
+            for offset in 0..period + 3 {
+                let mut at = MOMENT - 3 * period - offset;
+                let ticks = std::iter::from_fn(|| {
+                    let this = at;
+                    at += period + (this % 3);
+                    Some(this)
+                })
+                .take_while(|at| *at < MOMENT + 60);
+                let fired = fires(&once, Duration::from_secs(period), ticks);
+                assert_eq!(fired.len(), 1, "a {period}s tick from offset {offset} fired at {fired:?}");
+                assert!(
+                    fired[0] >= MOMENT && fired[0] < MOMENT + period + 3,
+                    "a {period}s tick from offset {offset} fired late, at {fired:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_tick_still_fires_a_job_once_per_scheduled_time() {
+        // Every ten seconds, ticked every second for two minutes: twelve runs,
+        // one per time, and never two for the same one.
+        let every_ten = Job {
+            schedule: "*/10 * * * * *".to_string(),
+            path: "/api/x".to_string(),
+            last_run: None,
+            last_status: None,
+        };
+        const START: u64 = 1_000_000_020;
+        let fired = fires(&every_ten, MIN_TICK, START + 1..=START + 120);
+        assert_eq!(fired, (1..=12).map(|n| START + n * 10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_tick_is_never_shorter_than_a_second() {
+        let (_dir, config) = config();
+        let state = AppState {
+            config: Arc::new(config),
+            runtime: crate::runtime::wasm::Runtime::new().unwrap(),
+        };
+        assert_eq!(Scheduler::new(state.clone()).period, DEFAULT_TICK);
+        assert_eq!(Scheduler::new(state.clone()).every(Duration::ZERO).period, MIN_TICK);
+        assert_eq!(Scheduler::new(state).every(Duration::from_secs(5)).period, Duration::from_secs(5));
     }
 
     #[test]
